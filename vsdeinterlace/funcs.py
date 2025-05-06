@@ -161,7 +161,7 @@ class FixInterlacedFades(CustomEnum):
     Brighten: FixInterlacedFades = object()  # type: ignore
 
     def __call__(
-        self, clip: vs.VideoNode, colors: float | list[float] | PlanesT = 0.0,
+        self, clip: vs.VideoNode, colors: float | list[float] | PlanesT | vs.VideoNode = 0.0,
         planes: PlanesT = None, func: FuncExceptT | None = None
     ) -> vs.VideoNode:
         """
@@ -177,7 +177,8 @@ class FixInterlacedFades(CustomEnum):
         Make sure to run this *after* IVTC!
 
         :param clip:                            Clip to process.
-        :param colors:                          Fade source/target color (floating-point plane averages).
+        :param colors:                          Fade source/target color (floating-point plane averages
+                                                or a single-frame clip matching the format of `clip`).
 
         :return:                                Clip with fades to/from `colors` accurately deinterlaced.
                                                 Frames that don't contain such fades may be damaged.
@@ -195,13 +196,21 @@ class FixInterlacedFades(CustomEnum):
 
         fields = limiter(f.work_clip).std.SeparateFields(tff=True)
 
-        fields = norm_expr(fields, 'x {color} - abs', planes, color=colors, func=func)
-        for i in f.norm_planes:
-            fields = fields.std.PlaneStats(None, i, f'P{i}')
+        if isinstance(colors, vs.VideoNode):
+            # limiter?
+            colors = FunctionUtil(colors, func, planes, vs.YUV, 32).work_clip
+            for i in f.norm_planes:
+                fields = fields.std.PlaneStats(colors, i, f'P{i}')
+            prop_name = 'Diff'
+        else:
+            fields = norm_expr(fields, 'x {color} - abs', planes, color=colors, func=func)
+            for i in f.norm_planes:
+                fields = fields.std.PlaneStats(None, i, f'P{i}')
+            prop_name = 'Average'
 
         props_clip = core.akarin.PropExpr(
             [f.work_clip, fields[::2], fields[1::2]], lambda: {  # type: ignore[misc]
-                f'f{t}Avg{i}': f'{c}.P{i}Average'  # type: ignore[has-type]
+                f'f{t}Avg{i}': f'{c}.P{i}{prop_name}'  # type: ignore[has-type]
                 for t, c in ['ty', 'bz']
                 for i in f.norm_planes
             }
@@ -212,8 +221,13 @@ class FixInterlacedFades(CustomEnum):
             'AVG@ 0 = x x {color} - x.ftAvg{i} x.fbAvg{i} {expr_mode} AVG@ / * {color} + ?'
         )
 
+        expr_clips = [props_clip]
+        if isinstance(colors, vs.VideoNode):
+            expr_clips.append(colors)
+            colors = 'y'
+
         fix = norm_expr(
-            props_clip, expr, planes,
+            expr_clips, expr, planes,
             i=f.norm_planes, color=colors,
             expr_mode='+ 2 /' if self == self.Average else 'min',
             func=func
